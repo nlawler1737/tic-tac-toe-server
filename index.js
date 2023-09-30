@@ -13,6 +13,7 @@ const crypto = require("crypto");
 require("dotenv").config();
 
 const responseBuilder = require("./utils/responseBuilder");
+const { match } = require("assert");
 
 const port = process.env.PORT;
 const socketPort = process.env.SOCKET_PORT;
@@ -47,7 +48,6 @@ const pool = mysql.createPool({
 
 const verifyJwtFromSocket = (token) => {
     try {
-        // console.log("token",token)
         const payload = jwt.verify(token, process.env.JWT_KEY);
         return { data: payload };
     } catch (err) {
@@ -59,11 +59,6 @@ app.use(cors(corsOptions));
 
 app.use(bodyParser.json());
 
-// app.use(cookieParser());
-
-// io.on("connect_error", (err) => {
-//   console.log(`connect_error due to ${err.message}`);
-// });
 
 io.on("connection", (socket) => {
     console.log("socket connected");
@@ -80,20 +75,17 @@ io.on("connection", (socket) => {
         socket.disconnect();
         return;
     }
-    // const room = crypto.randomUUID();
+    
     socket.userId = payload.data.userId;
     connectedSockets.set(payload.data.userId, {
         socket,
-        // room,
         opponentSocket: null,
         opponentId: null,
     });
 
-    // socket.join(room);
-    // console.log("con",io.sockets.adapter.rooms.get("test_room"));
     socket.on("disconnect", () => {
-        // console.log("dis",io.sockets.adapter.rooms.get("test_room"));
         console.log("user disconnected");
+        connectedSockets.delete(payload.data.userID)
     });
 });
 
@@ -118,17 +110,71 @@ const connectDatabase = async (req, res, next) => {
         req.db.release();
     } catch (err) {
         // If anything downstream throw an error, we must release the connection allocated for the request
-        console.log(err);
+        console.error("Error - connecting database",err.message);
         if (req.db) req.db.release();
         throw err;
     }
 };
 
-// app.use();
+const attachCurrentGame = async (req, res, next) => {
+    const { user } = req;
 
-// app.get("/", async function(req,res) {
-//     res.sendFile(path.join(__dirname, "dist", "index.html"))
-// })
+    try {
+        const [matchedUsers] = await req.db.query(
+            `
+            SELECT (current_game) FROM users
+            WHERE id = :userId AND current_game IS NOT NULL
+            `,
+            {
+                userId: user.userId,
+            }
+        );
+        const gameId = matchedUsers[0]?.current_game || undefined
+        if (gameId === undefined || gameId === null) {
+            req.currentGame = null
+            next()
+            return
+        }
+        const [[game]] = await req.db.query(`
+            SELECT * FROM games
+            WHERE id = :gameId;
+        `,{
+            gameId
+        })
+
+
+        const user1_socket = connectedSockets.get(game.user1_id);
+        const user2_socket = connectedSockets.get(game.user2_id);
+
+        if (user1_socket && user2_socket) {
+            
+            
+            connectedSockets.set(game.user_id, {
+                ...user1_socket,
+                opponentSocket: user2_socket.socket,
+                opponentId: game.user2_id,
+                gameId: game.id,
+            });
+            connectedSockets.set(game.user2_id, {
+                ...user2_socket,
+                opponentSocket: user1_socket.socket,
+                opponentId: game.user1_id,
+                gameId: game.id,
+            });
+            game.user1_socket = user1_socket
+            game.user2_socket = user2_socket
+        };
+            
+            req.currentGame = game;
+        
+        next()
+
+    } catch (err) {
+        console.error("Error - attaching game to user", err.message);
+        next()
+    }
+};
+
 
 app.post("/register", connectDatabase, async function (req, res) {
     try {
@@ -138,7 +184,6 @@ app.post("/register", connectDatabase, async function (req, res) {
         // Hashes the password and inserts the info into the `user` table
         await bcrypt.hash(req.body.password, 10).then(async (hash) => {
             try {
-                // console.log(await req.db.query("Select * from users"))
                 const [user] = await req.db.query(
                     `
                     INSERT INTO users (username, password)
@@ -158,17 +203,12 @@ app.post("/register", connectDatabase, async function (req, res) {
                     },
                     process.env.JWT_KEY
                 );
-                // res.json({"user_jwt":encodedUser})
-                console.log(encodedUser);
-            } catch (error) {
-                resError = error;
-                console.log("error", error);
+
+            } catch (err) {
+                resError = err;
+                console.error("Error - hashing password", err.message);
             }
         });
-
-        // res.cookie('user_jwt', `${encodedUser}`, {
-        //   httpOnly: true
-        // });
 
         if (resError) {
             if (resError.code === "ER_DUP_ENTRY")
@@ -177,8 +217,7 @@ app.post("/register", connectDatabase, async function (req, res) {
                 );
         } else res.json(responseBuilder({ jwt: encodedUser }, false));
     } catch (err) {
-        console.log("err", err);
-        console.log(err);
+        console.error("Error - registering user", err.message);
         res.json(responseBuilder({ msg: "Error Occurred Try Again" }, true));
     }
 });
@@ -186,7 +225,7 @@ app.post("/register", connectDatabase, async function (req, res) {
 app.post("/authenticate", connectDatabase, async function (req, res) {
     try {
         const { username, password } = req.body;
-        console.log(username, password);
+
         const [[user]] = await req.db.query(
             `SELECT * FROM users WHERE username = :username`,
             { username }
@@ -210,7 +249,7 @@ app.post("/authenticate", connectDatabase, async function (req, res) {
             res.json(responseBuilder({ msg: "Password not found" }, true));
         }
     } catch (err) {
-        console.log("Error in /authenticate", err);
+        console.error("Error - authenticating user", err.message);
     }
 });
 
@@ -230,41 +269,29 @@ const verifyJwt = async (req, res, next) => {
 
     try {
         const payload = jwt.verify(token, process.env.JWT_KEY);
-        // console.log(payload);
+        
         req.user = payload;
     } catch (err) {
-        console.log(err);
+        console.error("Error - verifying jwt", err.message)
         if (
             err.message &&
             (err.message.toUpperCase() === "INVALID TOKEN" ||
                 err.message.toUpperCase() === "JWT EXPIRED")
         ) {
-            // req.status = err.status || 500;
             req.body = err.message;
-            // req.app.emit("jwt-error", err, req);
-            // res.json("Error")
             await next();
         } else {
-            // next(err.status )
             next(err.status || 500, err.message);
         }
     }
 
     await next();
 };
-// app.use();
-// app.use(verifyJwt)
-
-// app.use((err,req,res,next)=>{
-//     console.error(err.stack)
-//     res.json("error")
-// })
 
 app.get("/history", connectDatabase, verifyJwt, async (req, res) => {
     console.log("queue GET");
     try {
         const { user, body, params } = req;
-        // console.log(params,query,user)
 
         const [history] = await req.db.query(
             `
@@ -283,36 +310,42 @@ app.get("/history", connectDatabase, verifyJwt, async (req, res) => {
     }
 });
 
-app.post("/join-queue", connectDatabase, verifyJwt, async (req, res) => {
+app.post("/join-queue", connectDatabase, verifyJwt, attachCurrentGame, async (req, res) => {
+    // check if user is already in game => res "already in game" => exit
+    // add user to queue
+    // check for opponent in queue
+    // create game
+    // remove both users from queue
+    // res "game starting"
+    // ping both sockets to start game
     console.log("join-queue");
-    const { user } = req;
+    const { user, currentGame } = req;
+
     const game_type = 0;
-    
-    const userInGame = await checkIfUserIsInGame();
-    
-    if (userInGame.status === "success") {
-        res.json(responseBuilder({code: 1, msg: "already in game" }, true));
-        return;
-    } else if (userInGame.status === "error") {
-        res.json(responseBuilder({ code: 0, msg: userInGame.value }, true));
-        return;
+
+    if (currentGame !== null) {
+        res.json(responseBuilder({ code: 1, msg: "already in game" }, true));
+        return
     }
-    
+
     const userInQueue = await addUserToQueue();
-    console.log("check",user.userId)
-    
+
     if (userInQueue.status === "error") {
-        res.json(responseBuilder({code: 2, msg: userInQueue.value }, true));
+        res.json(responseBuilder({ code: 0, msg: userInQueue.value }, true));
         return;
     }
 
     const opponentInQueue = await getFirstOpponentFromQueue();
 
     if (opponentInQueue.status === "error") {
-        res.json(responseBuilder({code:0, msg: opponentInQueue.value }, true));
+        res.json(
+            responseBuilder({ code: 0, msg: opponentInQueue.value }, true)
+        );
         return;
     } else if (opponentInQueue.status === "failed") {
-        res.json(responseBuilder({code:0, msg: "Waiting for Opponent..." }, false)); // no opponent
+        res.json(
+            responseBuilder({ code: 2, msg: "Waiting for Opponent..." }, false)
+        ); // no opponent
         return;
     }
 
@@ -323,10 +356,16 @@ app.post("/join-queue", connectDatabase, verifyJwt, async (req, res) => {
         [user.userId, opponent.user_id],
         game_type
     );
-    // console.log("user ids",user.userId, opponent.user_id)
-    addPlayerSocketsToMap(user.userId, opponent.user_id);
 
-    res.json(responseBuilder({code:3, msg: "Game Starting...", status: true }, false));
+    res.json(
+        responseBuilder(
+            { code: 3, msg: "Game Starting...", status: true },
+            false
+        )
+    );
+
+    updatePlayersSocketsMap(...game.value)
+
 
     /**
      *
@@ -352,9 +391,8 @@ app.post("/join-queue", connectDatabase, verifyJwt, async (req, res) => {
 
             return { status: true, value: nextPlayer[0] }; // opponent found
         } catch (err) {
-            console.log("Error - match err: ", err.message);
+            console.error("Error - match err: ", err.message);
             return { status: "error", value: err.message };
-            // res.json(responseBuilder({ msg: err.message, status: "error" }, true));
         }
     }
 
@@ -362,8 +400,6 @@ app.post("/join-queue", connectDatabase, verifyJwt, async (req, res) => {
         const rand = Math.random() >= 0.5 ? [0, 1] : [1, 0];
         const player1 = playerIds[rand[0]];
         const player2 = playerIds[rand[1]];
-
-        // console.log(player1,player2,rand)
 
         try {
             const [game] = await db.query(
@@ -379,13 +415,21 @@ app.post("/join-queue", connectDatabase, verifyJwt, async (req, res) => {
             );
 
             await removePlayersFromQueue();
-
-            return { status: "success", value: game.insertId };
-            // return { msg: "success", gameId: game.insertId, error: false };
+            
+            await db.query(`
+            UPDATE users
+            SET current_game = :game_id
+            WHERE id = :user1_id OR id = :user2_id;
+            `, {
+                game_id: game.insertId,
+                user1_id: player1,
+                user2_id: player2
+            })
+            
+            return { status: "success", value: [game.insertId, player1, player2] };
         } catch (err) {
             console.error("Error - create game", err.message);
             return { status: "error", value: err.message };
-            // return { msg: err.message, error: true };
         }
 
         async function removePlayersFromQueue() {
@@ -400,9 +444,6 @@ app.post("/join-queue", connectDatabase, verifyJwt, async (req, res) => {
                         user2_id: player2,
                     }
                 );
-                console.log(
-                    `users ${player1} and ${player2} removed from queue`
-                );
             } catch (err) {
                 console.error(
                     "Error - remove players from queue: ",
@@ -412,51 +453,25 @@ app.post("/join-queue", connectDatabase, verifyJwt, async (req, res) => {
         }
     }
 
-    function addPlayerSocketsToMap(user_id, opponent_id) {
-        const userSocket = connectedSockets.get(user_id);
-        const opponentSocket = connectedSockets.get(opponent_id);
+    function updatePlayersSocketsMap(gameId,user1_id, user2_id) {
+        const user1_socket = connectedSockets.get(user1_id) || {};
+        const user2_socket = connectedSockets.get(user2_id) || {};
 
-        console.log({userSocket, opponentSocket})
-
-        if (!userSocket || !opponentSocket) return;
-
-        connectedSockets.set(user_id, {
-            ...userSocket,
-            opponentSocket: opponentSocket.socket,
-            opponentId: opponent_id,
-            gameId: game.gameId,
+        connectedSockets.set(user1_id, {
+            ...user1_socket,
+            opponentSocket: user2_socket.socket,
+            opponentId: user2_id,
+            gameId,
         });
-        connectedSockets.set(opponent_id, {
-            ...opponentSocket,
-            opponentSocket: userSocket.socket,
-            opponentId: user_id,
-            gameId: game.gameId,
+        connectedSockets.set(user2_id, {
+            ...user2_socket,
+            opponentSocket: user1_socket.socket,
+            opponentId: user1_id,
+            gameId,
         });
 
-        userSocket.socket.emit("game-start");
-        opponentSocket.socket.emit("game-start");
-        console.log("pinged", user_id, "and", opponent_id, "to start game")
-    }
-
-    async function checkIfUserIsInGame() {
-        try {
-            const [gamesUserIsIn] = await req.db.query(
-                `
-                SELECT * FROM games
-                WHERE (
-                    user1_id = :user_id OR user2_id = :user_id
-                )
-                AND winner IS NULL`,
-                {
-                    user_id: user.userId,
-                }
-            );
-            if (gamesUserIsIn.length) return { status: "success" };
-        } catch (err) {
-            console.error("Error - in game: ", err.message);
-            return { status: "error", value: err.message };
-        }
-        return { status: true };
+        user1_socket.socket.emit("game-start");
+        user2_socket.socket.emit("game-start");
     }
 
     async function addUserToQueue() {
@@ -473,73 +488,60 @@ app.post("/join-queue", connectDatabase, verifyJwt, async (req, res) => {
             );
             return { status: true };
         } catch (err) {
-            // if (err.code === "ER_DUP_ENTRY") userAlreadyInQueue = true;
-            // else
-
+            console.error("Error - adding user to queue", err.message)
             return { status: "error", value: err.message };
         }
     }
-    //res.json(responseBuilder({msg:"Waiting For Opponent..."},false))
 });
 
-app.put("/game-state", connectDatabase, verifyJwt, async (req, res) => {
+// app.get("/user/:username",connectDatabase, verifyJwt, async (req, res) => {})
+
+app.put("/game-state", connectDatabase, verifyJwt, attachCurrentGame, async (req, res) => {
     console.log("PUT - game state");
 
-    const { user, body } = req;
+    const { user, body, currentGame } = req;
 
     const userGameState = body.gameState;
-    console.log(user.userId,userGameState);
-    // const test = connectedSockets.get(user.userId)
-    // console.log(user.userId);
-    // let game
-    const gotGame = await getGameData();
-    if (gotGame.status === "error") {
-        res.redirect("/");
-        // res.json(responseBuilder({ msg: gotGame.value }, true));
-        return;
-    }
-    if (gotGame.status === "failed") {
-        res.redirect("/");
-        return;
+
+    if (currentGame === null) {
+        res.json(responseBuilder({msg: "not currently in game"},true))
+        return
     }
 
-    const game = gotGame.value;
-    const { id: gameId, user1_id, user2_id } = game;
-    const currentTurnCount = getTurnCount(game.game_state);
-    const correctTurn = game.user1_id === user.userId ? 0 : 1;
+    const { id: gameId, user1_id, user2_id } = currentGame;
+    const currentTurnCount = getTurnCount(currentGame.game_state);
+    const correctTurn = currentGame.user1_id === user.userId ? 0 : 1;
     const userTurn = currentTurnCount % 2 === correctTurn;
 
-    // const 
-
-    const defaultRes = function(){
-        // console.log(game.game_state)
-        const winner = checkWinner(game.game_state)
-        let gameStatus = ""
+    const defaultRes = (function () {
+        const winner = checkWinner(currentGame.game_state);
+        let gameStatus = "";
 
         if (winner !== null) {
-            gameStatus = winner === -1 ? "Draw" : winner === 0 ? "X Wins" : "O Wins"
+            gameStatus =
+                winner === -1 ? "Draw" : winner === 0 ? "X Wins" : "O Wins";
         } else {
-            gameStatus = userTurn ? "Your Turn" : "Opponents Turn"
+            gameStatus = userTurn ? "Your Turn" : "Opponents Turn";
         }
         return {
-            gameState: game.game_state,
+            gameState: currentGame.game_state,
             player: correctTurn,
-            gameStatus,//: checkWinner(game.gameState) != null ? userTurn ? "Your Turn" : "Opponents Turn"
-            winner
-        }
-    }();
+            gameStatus,
+            winner,
+        };
+    })();
 
     if (body.getUpdate) {
+        if (currentGame.winner !== null) await updatePlayersCurrentGameToNull()
         res.json(
             responseBuilder({ msg: "Current State", ...defaultRes }, false)
         );
         return;
     }
 
-    // const tooManyEntries == game
-    const correctTurnCount = getTurnCount(game.game_state) + 1;
+    const correctTurnCount = getTurnCount(currentGame.game_state) + 1;
     const isCorrectTurnCount = correctTurnCount === getTurnCount(userGameState);
-    const isValidTurn = checkCorrectTurn(game.game_state, userGameState);
+    const isValidTurn = checkCorrectTurn(currentGame.game_state, userGameState);
     if (!userTurn) {
         res.json(
             responseBuilder({ msg: "Not Your Turn", ...defaultRes }, true)
@@ -564,7 +566,7 @@ app.put("/game-state", connectDatabase, verifyJwt, async (req, res) => {
 
 
     const oppSocket = connectedSockets.get(
-        user.userId == game.user1_id ? game.user2_id : game.user1_id
+        user.userId == currentGame.user1_id ? currentGame.user2_id : currentGame.user1_id
     );
     oppSocket.socket.emit("game-update");
 
@@ -575,12 +577,11 @@ app.put("/game-state", connectDatabase, verifyJwt, async (req, res) => {
     };
 
     const gameWinner = checkWinner(userGameState);
-    finalRes.winner = gameWinner
-    
+    finalRes.winner = gameWinner;
+
     if (gameWinner !== null) {
-        // console.log({gameWinner})
-        const updatedGameWinner = await updateGameWinner(gameWinner)
-        console.log({updatedGameWinner})
+        const updatedGameWinner = await updateGameWinner(gameWinner);
+        await updatePlayersCurrentGameToNull()
     }
 
     if (gameWinner === -1) {
@@ -594,8 +595,6 @@ app.put("/game-state", connectDatabase, verifyJwt, async (req, res) => {
     res.json(
         responseBuilder({ msg: "Turn Made", ...defaultRes, ...finalRes }, false)
     );
-
-
 
     function checkWinner(gameState) {
         const lines = [
@@ -635,7 +634,7 @@ app.put("/game-state", connectDatabase, verifyJwt, async (req, res) => {
         for (let i in oldGameState) {
             const move = newGameState[i];
             if (!(move == null || move == 0 || move == 1)) {
-                console.log("invalid turn type");
+                console.error("invalid turn type");
                 return false;
             }
             if (oldGameState[i] != move) {
@@ -645,11 +644,11 @@ app.put("/game-state", connectDatabase, verifyJwt, async (req, res) => {
         }
 
         if (notMatched > 1) {
-            console.log("invalid changed turns", notMatched);
+            console.error("invalid changed turns", notMatched);
             return false;
         }
         if (moveMade !== currentTurnCount % 2) {
-            console.log("invalid user turn", moveMade, correctTurnCount % 2);
+            console.error("invalid user turn", moveMade, correctTurnCount % 2);
             return false;
         }
 
@@ -658,17 +657,37 @@ app.put("/game-state", connectDatabase, verifyJwt, async (req, res) => {
 
     async function updateGameWinner(gameWinner) {
         try {
-            await req.db.query(`
+            await req.db.query(
+                `
             UPDATE games
             SET winner = :winner, end_time = NOW()
-            WHERE id = :gameId AND winner IS NULL`, {
-                winner: gameWinner === -1 ? -1 : [user1_id, user2_id][gameWinner],
-                gameId
-            })
-            return {status: "success"}
+            WHERE id = :gameId AND winner IS NULL`,
+                {
+                    winner:
+                        gameWinner === -1
+                            ? -1
+                            : [user1_id, user2_id][gameWinner],
+                    gameId,
+                }
+            );
+            return { status: "success" };
         } catch (err) {
-            console.error("Error - updating game winner", err.message)
-            return {status: "error", value: err.message}
+            console.error("Error - updating game winner", err.message);
+            return { status: "error", value: err.message };
+        }
+    }
+
+    async function updatePlayersCurrentGameToNull() {
+        try {
+            await req.db.query(`
+            UPDATE users
+            SET current_game = NULL
+            WHERE id = :userId;
+            `, {
+                userId: user.userId,
+            })
+        } catch (err) {
+            console.error("Error - setting current game to NULL", err.message)
         }
     }
 
@@ -685,7 +704,7 @@ app.put("/game-state", connectDatabase, verifyJwt, async (req, res) => {
                     gameId,
                 }
             );
-            // console.log({ updated });
+            
             return { status: "success" };
         } catch (err) {
             console.error("Error - updating game state", err.message);
@@ -693,29 +712,6 @@ app.put("/game-state", connectDatabase, verifyJwt, async (req, res) => {
         }
     }
 
-    async function getGameData(gameId) {
-        // gameId = connectedSockets.get(user.userId).game;
-        try {
-            const [[gameData]] = await req.db.query(
-                `
-            SELECT * FROM games
-            WHERE (
-                user1_id = :userId OR user2_id = :userId
-                )
-            AND winner IS NULL
-            LIMIT 1;
-            `,
-                {
-                    userId: user.userId,
-                }
-            );
-            if (!gameData) return { status: "failed", value: "No Games Found" };
-            return { status: "success,", value: gameData };
-        } catch (err) {
-            console.error("Error - getting game from database", err.message);
-            return { status: "error", value: err.message };
-        }
-    }
 });
 
 app.get("/login", connectDatabase, (req, res) => {

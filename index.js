@@ -298,8 +298,9 @@ app.get("/user/:userId", connectDatabase, async (req, res) => {
     if (gameHistory.status === "error") {
         res.json(responseBuilder({msg: gameHistory.value},true))
     }
-
-    res.json(responseBuilder({ msg: "user data received", data: {history: gameHistory.value, totals: gameTotals.value} }, false));
+    // console.log(gameHistory.value, gameTotals.value)
+    if (!gameHistory.value.length) res.json(responseBuilder({msg:"no games played", data: {history: [], totals: {}}}))
+    else res.json(responseBuilder({ msg: "user data received", data: {history: gameHistory.value, totals: gameTotals.value} }, false));
 
     async function getGameHistory() {
         try {
